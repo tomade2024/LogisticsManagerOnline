@@ -53,7 +53,7 @@ class Player(Base):
     __tablename__ = "players"
     id: Mapped[str] = mapped_column(String, primary_key=True)
     display_name: Mapped[str] = mapped_column(String, unique=True, index=True)
-    money_cents: Mapped[int] = mapped_column(BigInteger, default=100000)  # 1000€
+    money_cents: Mapped[int] = mapped_column(BigInteger, default=100000)  # 100000€
     level: Mapped[int] = mapped_column(Integer, default=1)
     created_at: Mapped[dt.datetime] = mapped_column(DateTime(timezone=True), default=dt.datetime.utcnow)
 
