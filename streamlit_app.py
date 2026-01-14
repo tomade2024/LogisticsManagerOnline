@@ -205,7 +205,7 @@ def get_or_create_player(db, display_name: str) -> Player:
     p = db.query(Player).filter(Player.display_name == name).first()
     if p:
         return p
-    p = Player(id=str(uuid.uuid4()), display_name=name, money_cents=100000)
+    p = Player(id=str(uuid.uuid4()), display_name=name, money_cents=1000000)
     db.add(p)
     db.commit()
     db.refresh(p)
