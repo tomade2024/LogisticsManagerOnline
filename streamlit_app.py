@@ -53,7 +53,7 @@ class Player(Base):
     __tablename__ = "players"
     id: Mapped[str] = mapped_column(String, primary_key=True)
     display_name: Mapped[str] = mapped_column(String, unique=True, index=True)
-    money_cents: Mapped[int] = mapped_column(BigInteger, default=100000)  # 10000€
+    money_cents: Mapped[int] = mapped_column(BigInteger, default=100000)  # 1000€
     level: Mapped[int] = mapped_column(Integer, default=1)
     created_at: Mapped[dt.datetime] = mapped_column(DateTime(timezone=True), default=dt.datetime.utcnow)
 
@@ -459,3 +459,343 @@ def ensure_auto_events(db, site_id: str, inbound_every_min: int, order_every_min
     Streamlit hat keinen Background-Job. Das läuft pro App-Run.
     """
     now = dt.datetime.utcnow()
+
+    # Inbound: nicht erzeugen, wenn bereits ARRIVED offen ist
+    if inbound_every_min and inbound_every_min > 0:
+        open_arrived = db.query(InboundShipment).filter(
+            InboundShipment.site_id == site_id,
+            InboundShipment.status == "ARRIVED"
+        ).first()
+
+        if not open_arrived:
+            last_ship = db.query(InboundShipment).filter(
+                InboundShipment.site_id == site_id
+            ).order_by(InboundShipment.created_at.desc()).first()
+
+            due = True
+            if last_ship:
+                due = (now - last_ship.created_at).total_seconds() >= inbound_every_min * 60
+
+            if due:
+                generate_shipment(db, site_id)
+
+    # Orders: nicht erzeugen, wenn OPEN vorhanden
+    if order_every_min and order_every_min > 0:
+        open_order = db.query(Order).filter(
+            Order.site_id == site_id,
+            Order.status == "OPEN"
+        ).first()
+
+        if not open_order:
+            last_order = db.query(Order).filter(
+                Order.site_id == site_id
+            ).order_by(Order.due_at.desc()).first()
+
+            # Wir approximieren created_at via due_at - 2h (weil wir due_at = now + 2h setzen)
+            due = True
+            if last_order:
+                approx_created = last_order.due_at.replace(tzinfo=None) - dt.timedelta(hours=2)
+                due = (now - approx_created).total_seconds() >= order_every_min * 60
+
+            if due:
+                generate_order(db, site_id)
+
+def next_due_times(db, site_id: str, inbound_every_min: int, order_every_min: int):
+    now = dt.datetime.utcnow()
+    inbound_due = None
+    order_due = None
+
+    if inbound_every_min and inbound_every_min > 0:
+        last_ship = db.query(InboundShipment).filter(
+            InboundShipment.site_id == site_id
+        ).order_by(InboundShipment.created_at.desc()).first()
+        inbound_due = (last_ship.created_at + dt.timedelta(minutes=inbound_every_min)) if last_ship else now
+
+    if order_every_min and order_every_min > 0:
+        last_order = db.query(Order).filter(
+            Order.site_id == site_id
+        ).order_by(Order.due_at.desc()).first()
+        if last_order:
+            approx_created = last_order.due_at.replace(tzinfo=None) - dt.timedelta(hours=2)
+            order_due = approx_created + dt.timedelta(minutes=order_every_min)
+        else:
+            order_due = now
+
+    return inbound_due, order_due
+
+
+# =========================================================
+# UI
+# =========================================================
+st.set_page_config(page_title="Logistics Manager (MVP)", layout="wide")
+
+init_db()
+with SessionLocal() as db:
+    ensure_seed(db)
+
+st.sidebar.title("Logistics Manager (MVP)")
+
+display_name = st.sidebar.text_input("Spielername (Login MVP)", value=st.session_state.get("display_name", "Tester"))
+st.session_state["display_name"] = display_name
+
+st.sidebar.subheader("Auto-Events")
+auto_events = st.sidebar.checkbox("Automatisch Lieferungen & Aufträge erzeugen", value=True)
+inbound_every = st.sidebar.number_input("Lieferung alle X Minuten", min_value=0, max_value=120, value=5, step=1)
+order_every = st.sidebar.number_input("Auftrag alle Y Minuten", min_value=0, max_value=120, value=7, step=1)
+st.session_state["auto_events"] = auto_events
+st.session_state["inbound_every"] = int(inbound_every)
+st.session_state["order_every"] = int(order_every)
+
+page = st.sidebar.radio(
+    "Navigation",
+    ["Home", "Weltkarte", "Lager", "Wareneingang", "Aufträge", "Personal", "Finanzen", "Rangliste"]
+)
+
+with SessionLocal() as db:
+    player = get_or_create_player(db, display_name)
+    st.session_state["player_id"] = player.id
+    site = get_site(db, player.id)
+
+    # Auto-Events (pro Run)
+    if site and st.session_state.get("auto_events", True):
+        ensure_auto_events(
+            db,
+            site_id=site.id,
+            inbound_every_min=st.session_state.get("inbound_every", 5),
+            order_every_min=st.session_state.get("order_every", 7)
+        )
+
+    # Sidebar Status
+    st.sidebar.metric("Geld", f"{player.money_cents/100:,.2f} €")
+    if site:
+        st.sidebar.success(f"Standort: {site.site_name}")
+    else:
+        st.sidebar.info("Kein Standort → Weltkarte")
+
+    # Next due info
+    if site and st.session_state.get("auto_events", True):
+        inbound_due, order_due = next_due_times(
+            db, site.id,
+            st.session_state.get("inbound_every", 5),
+            st.session_state.get("order_every", 7)
+        )
+        if inbound_due:
+            st.sidebar.caption(f"Nächste Lieferung frühestens: {inbound_due:%H:%M:%S} UTC")
+        if order_due:
+            st.sidebar.caption(f"Nächster Auftrag frühestens: {order_due:%H:%M:%S} UTC")
+
+    # ---------------- Pages ----------------
+    if page == "Home":
+        st.title("Logistics Manager Online — MVP")
+        st.write("Kernloop: Standort kaufen → Lager bauen → Lieferungen annehmen → Aufträge erfüllen → expandieren.")
+        st.info("Hinweis: Auto-Events entstehen bei Navigation/Reload (Streamlit-typisch).")
+
+    elif page == "Weltkarte":
+        st.title("Weltkarte / Grundstücke")
+        if site:
+            st.success(f"Du besitzt bereits einen Standort: {site.site_name}")
+        else:
+            plots = db.query(Plot).filter(Plot.is_active == True).all()
+            rows = [{
+                "plot_id": p.id,
+                "Name": p.name,
+                "Preis (€)": p.price_cents/100,
+                "Größe": f"{p.width}x{p.height}",
+                "Bonus": f"{p.bonus_type} {float(p.bonus_value):+.0%}",
+            } for p in plots]
+            st.dataframe(rows, hide_index=True, use_container_width=True)
+
+            pick = st.selectbox(
+                "Plot auswählen",
+                options=[r["plot_id"] for r in rows],
+                format_func=lambda pid: next(r["Name"] for r in rows if r["plot_id"] == pid),
+            )
+            site_name = st.text_input("Standortname", value="Mein Lager")
+            if st.button("Grundstück kaufen", type="primary"):
+                try:
+                    buy_site(db, player.id, pick, site_name)
+                    st.success("Kauf erfolgreich. Gehe zu Lager.")
+                    st.rerun()
+                except Exception as e:
+                    st.error(str(e))
+
+    elif page == "Lager":
+        st.title("Lager")
+        if not site:
+            st.warning("Bitte zuerst Standort kaufen (Weltkarte).")
+        else:
+            site = get_site(db, player.id)
+            left, right = st.columns([2, 1])
+
+            with right:
+                st.subheader("Bauen")
+                defs = db.query(ObjectDef).all()
+                obj_type = st.selectbox(
+                    "Objekt",
+                    options=[d.object_type for d in defs],
+                    format_func=lambda t: next(d.name for d in defs if d.object_type == t)
+                )
+                x = st.number_input("X", min_value=0, max_value=site.plot.width - 1, value=0, step=1)
+                y = st.number_input("Y", min_value=0, max_value=site.plot.height - 1, value=0, step=1)
+
+                d = next(dd for dd in defs if dd.object_type == obj_type)
+                st.caption(f"Kosten: {d.buy_cost_cents/100:,.2f} € | Größe: {d.w}x{d.h} | Slots: {d.rack_slots}")
+
+                if st.button("Platzieren", type="primary"):
+                    try:
+                        place_object(db, player.id, site, obj_type, int(x), int(y))
+                        st.success("Platziert.")
+                        st.rerun()
+                    except Exception as e:
+                        st.error(str(e))
+
+                total, used = compute_capacity(db, site.id)
+                st.metric("Kapazität (Slots)", f"{used} / {total}")
+
+            with left:
+                placed = db.query(PlacedObject).filter(
+                    PlacedObject.site_id == site.id
+                ).order_by(PlacedObject.created_at.asc()).all()
+
+                st.subheader("Raster")
+                width, height = site.plot.width, site.plot.height
+                grid = [["" for _ in range(width)] for __ in range(height)]
+                for o in placed:
+                    label = o.object_type.replace("RACK_", "R")
+                    for dy in range(o.h):
+                        for dx in range(o.w):
+                            gx, gy = o.x + dx, o.y + dy
+                            if 0 <= gx < width and 0 <= gy < height:
+                                grid[gy][gx] = label
+                st.dataframe(pd.DataFrame(grid), use_container_width=True, height=450)
+
+                st.subheader("Objekte (inkl. Löschen)")
+                refund_ratio = st.slider("Rückerstattung beim Löschen (%)", 0, 100, 50) / 100
+
+                obj_rows = [{
+                    "ID": o.id,
+                    "Typ": o.object_type,
+                    "Pos": f"({o.x},{o.y})",
+                    "Größe": f"{o.w}x{o.h}",
+                    "Erstellt": o.created_at.strftime("%Y-%m-%d %H:%M"),
+                } for o in placed]
+
+                st.dataframe(obj_rows, hide_index=True, use_container_width=True)
+
+                delete_id = st.selectbox("Objekt-ID zum Löschen", options=[""] + [r["ID"] for r in obj_rows])
+                if delete_id and st.button("Objekt löschen", type="secondary"):
+                    try:
+                        delete_object(db, player.id, site.id, delete_id, refund_ratio=refund_ratio)
+                        st.success("Objekt gelöscht.")
+                        st.rerun()
+                    except Exception as e:
+                        st.error(str(e))
+
+    elif page == "Wareneingang":
+        st.title("Wareneingang")
+        if not site:
+            st.warning("Bitte zuerst Standort kaufen (Weltkarte).")
+        else:
+            shipments = db.query(InboundShipment).options(
+                joinedload(InboundShipment.lines).joinedload(InboundLine.item)
+            ).filter(
+                InboundShipment.site_id == site.id
+            ).order_by(InboundShipment.created_at.desc()).all()
+
+            if not shipments:
+                st.info("Noch keine Lieferungen. Auto-Events erzeugen welche beim Navigieren/Reload.")
+            else:
+                for s in shipments:
+                    with st.expander(f"{s.status} | {s.created_at:%Y-%m-%d %H:%M} | ID: {s.id}"):
+                        st.dataframe(
+                            [{"SKU": ln.item.sku, "Artikel": ln.item.name, "Menge": ln.qty} for ln in s.lines],
+                            hide_index=True
+                        )
+                        if s.status == "ARRIVED":
+                            if st.button(f"Annehmen ({s.id})", key=f"acc_{s.id}", type="primary"):
+                                try:
+                                    accept_shipment(db, site.id, s.id)
+                                    st.success("Angenommen und eingelagert.")
+                                    st.rerun()
+                                except Exception as e:
+                                    st.error(str(e))
+
+    elif page == "Aufträge":
+        st.title("Aufträge")
+        if not site:
+            st.warning("Bitte zuerst Standort kaufen (Weltkarte).")
+        else:
+            orders = db.query(Order).options(
+                joinedload(Order.lines).joinedload(OrderLine.item)
+            ).filter(
+                Order.site_id == site.id
+            ).order_by(Order.due_at.asc()).all()
+
+            if not orders:
+                st.info("Noch keine Aufträge. Auto-Events erzeugen welche beim Navigieren/Reload.")
+            else:
+                for o in orders:
+                    with st.expander(f"{o.status} | Reward {o.reward_cents/100:,.2f} € | Fällig {o.due_at:%Y-%m-%d %H:%M} | ID {o.id}"):
+                        st.dataframe(
+                            [{"SKU": ln.item.sku, "Artikel": ln.item.name, "Menge": ln.qty} for ln in o.lines],
+                            hide_index=True
+                        )
+                        if o.status == "OPEN":
+                            if st.button(f"Starten ({o.id})", key=f"start_{o.id}", type="primary"):
+                                try:
+                                    start_order(db, player.id, site.id, o.id)
+                                    st.success("Auftrag erfüllt und bezahlt.")
+                                    st.rerun()
+                                except Exception as e:
+                                    st.error(str(e))
+
+    elif page == "Personal":
+        st.title("Personal")
+        if not site:
+            st.warning("Bitte zuerst Standort kaufen (Weltkarte).")
+        else:
+            n = st.number_input("Anzahl Lagerarbeiter", min_value=1, max_value=20, value=1, step=1)
+            wage = st.number_input("Lohn €/h", min_value=8.0, max_value=40.0, value=15.0, step=0.5)
+
+            if st.button("Einstellen", type="primary"):
+                hire_workers(db, site.id, int(n), int(wage * 100))
+                st.success("Eingestellt.")
+                st.rerun()
+
+            emps = db.query(Employee).filter(Employee.site_id == site.id).all()
+            st.dataframe([{
+                "ID": e.id,
+                "Rolle": e.role,
+                "Effizienz": float(e.efficiency),
+                "Lohn €/h": e.wage_cents_per_hour/100,
+                "Status": e.status
+            } for e in emps], hide_index=True, use_container_width=True)
+
+            st.caption("MVP: Payroll/Arbeitsleistung wird später zeitbasiert simuliert.")
+
+    elif page == "Finanzen":
+        st.title("Finanzen / Ledger")
+        st.metric("Kontostand", f"{player.money_cents/100:,.2f} €")
+
+        led = db.query(LedgerEntry).filter(
+            LedgerEntry.player_id == player.id
+        ).order_by(LedgerEntry.created_at.desc()).limit(200).all()
+
+        if not led:
+            st.info("Noch keine Buchungen.")
+        else:
+            st.dataframe([{
+                "Zeit": e.created_at.strftime("%Y-%m-%d %H:%M"),
+                "Typ": e.entry_type,
+                "Betrag (€)": e.amount_cents/100,
+                "Ref": f"{e.ref_type or ''} {e.ref_id or ''}".strip()
+            } for e in led], hide_index=True, use_container_width=True)
+
+    elif page == "Rangliste":
+        st.title("Rangliste (MVP: Kontostand)")
+        top = db.query(Player).order_by(Player.money_cents.desc()).limit(20).all()
+        st.dataframe([{
+            "Spieler": p.display_name,
+            "Geld (€)": p.money_cents/100,
+            "Level": p.level
+        } for p in top], hide_index=True, use_container_width=True)
