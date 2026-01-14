@@ -200,6 +200,30 @@ def ensure_seed(db):
 # -----------------------------
 # Helpers / Business
 # -----------------------------
+def delete_object(db, player_id: str, site_id: str, object_id: str, refund_ratio: float = 0.5):
+    obj = db.query(PlacedObject).filter(
+        PlacedObject.id == object_id,
+        PlacedObject.site_id == site_id
+    ).first()
+    if not obj:
+        raise ValueError("Objekt nicht gefunden.")
+
+    obj_def = db.query(ObjectDef).filter(ObjectDef.object_type == obj.object_type).first()
+    refund = 0
+    if obj_def and refund_ratio > 0:
+        refund = int(obj_def.buy_cost_cents * refund_ratio)
+
+    # delete
+    db.delete(obj)
+
+    # refund
+    if refund > 0:
+        player = db.query(Player).filter(Player.id == player_id).first()
+        player.money_cents += refund
+        ledger(db, player_id, "REFUND_BUILD", refund, "OBJECT", object_id)
+
+    db.commit()
+
 def get_or_create_player(db, display_name: str) -> Player:
     name = (display_name or "Player").strip()
     p = db.query(Player).filter(Player.display_name == name).first()
@@ -266,6 +290,83 @@ def compute_capacity(db, site_id: str):
     used = db.query(Inventory).filter(Inventory.site_id == site_id).with_entities(Inventory.qty).all()
     used_qty = sum(int(q[0]) for q in used)
     return total, used_qty
+def ensure_auto_events(db, site_id: str, inbound_every_min: int, order_every_min: int):
+    """
+    Streamlit hat keinen Background-Job. Diese Funktion wird pro App-Run aufgerufen
+    und erzeugt ggf. automatisch eine Lieferung / einen Auftrag.
+    """
+    now = dt.datetime.utcnow()
+
+    # ----- Inbound -----
+    if inbound_every_min and inbound_every_min > 0:
+        # Wenn bereits eine ARRIVED Lieferung existiert, nichts erzeugen
+        open_arrived = db.query(InboundShipment).filter(
+            InboundShipment.site_id == site_id,
+            InboundShipment.status == "ARRIVED"
+        ).first()
+
+        if not open_arrived:
+            last_shipment = db.query(InboundShipment).filter(
+                InboundShipment.site_id == site_id
+            ).order_by(InboundShipment.created_at.desc()).first()
+
+            due = True
+            if last_shipment:
+                delta = now - last_shipment.created_at
+                due = delta.total_seconds() >= inbound_every_min * 60
+
+            if due:
+                generate_shipment(db, site_id)
+
+    # ----- Orders -----
+    if order_every_min and order_every_min > 0:
+        # Wenn bereits ein OPEN Auftrag existiert, nichts erzeugen
+        open_order = db.query(Order).filter(
+            Order.site_id == site_id,
+            Order.status == "OPEN"
+        ).first()
+
+        if not open_order:
+            last_order = db.query(Order).filter(
+                Order.site_id == site_id
+            ).order_by(Order.due_at.desc()).first()
+
+            due = True
+            if last_order:
+                # wir nehmen als Referenz: created_at fehlt im Model -> dann due_at als Näherung
+                # (Alternative: du ergänzt später created_at im Order-Model)
+                delta = now - last_order.due_at.replace(tzinfo=None)
+                due = delta.total_seconds() >= order_every_min * 60
+
+            if due:
+                generate_order(db, site_id)
+
+
+def next_due_times(db, site_id: str, inbound_every_min: int, order_every_min: int):
+    """Nur Anzeige: wann wäre das nächste Event fällig?"""
+    now = dt.datetime.utcnow()
+    inbound_due = None
+    order_due = None
+
+    if inbound_every_min and inbound_every_min > 0:
+        last_shipment = db.query(InboundShipment).filter(
+            InboundShipment.site_id == site_id
+        ).order_by(InboundShipment.created_at.desc()).first()
+        if last_shipment:
+            inbound_due = last_shipment.created_at + dt.timedelta(minutes=inbound_every_min)
+        else:
+            inbound_due = now
+
+    if order_every_min and order_every_min > 0:
+        last_order = db.query(Order).filter(
+            Order.site_id == site_id
+        ).order_by(Order.due_at.desc()).first()
+        if last_order:
+            order_due = last_order.due_at.replace(tzinfo=None) + dt.timedelta(minutes=order_every_min)
+        else:
+            order_due = now
+
+    return inbound_due, order_due
 
 def generate_shipment(db, site_id: str):
     now = dt.datetime.utcnow()
@@ -353,11 +454,29 @@ page = st.sidebar.radio(
     "Navigation",
     ["Home", "Weltkarte", "Lager", "Wareneingang", "Aufträge", "Personal", "Finanzen", "Rangliste"],
 )
+st.sidebar.subheader("Auto-Events (MVP)")
+auto_events = st.sidebar.checkbox("Automatisch Lieferungen & Aufträge erzeugen", value=True)
+
+inbound_every = st.sidebar.number_input("Lieferung alle X Minuten", min_value=0, max_value=120, value=5, step=1)
+order_every = st.sidebar.number_input("Auftrag alle Y Minuten", min_value=0, max_value=120, value=7, step=1)
+
+st.session_state["auto_events"] = auto_events
+st.session_state["inbound_every"] = int(inbound_every)
+st.session_state["order_every"] = int(order_every)
 
 with SessionLocal() as db:
     player = get_or_create_player(db, display_name)
     st.session_state["player_id"] = player.id
     site = get_site(db, player.id)
+    
+# Auto-Events: werden bei jedem App-Run geprüft
+if site and st.session_state.get("auto_events", True):
+    ensure_auto_events(
+        db,
+        site_id=site.id,
+        inbound_every_min=st.session_state.get("inbound_every", 5),
+        order_every_min=st.session_state.get("order_every", 7),
+    )
 
     st.sidebar.metric("Geld", f"{player.money_cents/100:,.2f} €")
     if site:
@@ -365,6 +484,19 @@ with SessionLocal() as db:
     else:
         st.sidebar.info("Kein Standort. → Weltkarte")
 
+    if site and st.session_state.get("auto_events", True):
+    inbound_due, order_due = next_due_times(
+        db,
+        site.id,
+        st.session_state.get("inbound_every", 5),
+        st.session_state.get("order_every", 7),
+    )
+    if inbound_due:
+        st.sidebar.caption(f"Nächste Lieferung frühestens: {inbound_due:%H:%M:%S} UTC")
+    if order_due:
+        st.sidebar.caption(f"Nächster Auftrag frühestens: {order_due:%H:%M:%S} UTC")
+
+    
     if page == "Home":
         st.title("Logistics Manager Online — Streamlit Single-File MVP")
         st.write("MVP: Standort kaufen, Lager bauen (X/Y), Lieferungen annehmen, Aufträge erfüllen, Ledger/Rangliste.")
@@ -438,8 +570,33 @@ with SessionLocal() as db:
 
                 st.subheader("Objekte")
                 st.dataframe([{
-                    "Typ": o.object_type, "Pos": f"({o.x},{o.y})", "Größe": f"{o.w}x{o.h}",
-                    "Erstellt": o.created_at.strftime("%Y-%m-%d %H:%M")
+                    st.subheader("Objekte (inkl. Löschen)")
+refund_ratio = st.slider("Rückerstattung beim Löschen (%)", 0, 100, 50) / 100
+
+obj_rows = []
+for o in placed:
+    obj_rows.append({
+        "ID": o.id,
+        "Typ": o.object_type,
+        "Pos": f"({o.x},{o.y})",
+        "Größe": f"{o.w}x{o.h}",
+        "Erstellt": o.created_at.strftime("%Y-%m-%d %H:%M"),
+    })
+
+st.dataframe(obj_rows, hide_index=True, use_container_width=True)
+
+st.caption("Zum Löschen: ID auswählen und bestätigen.")
+delete_id = st.selectbox("Objekt-ID zum Löschen", options=[""] + [r["ID"] for r in obj_rows])
+
+if delete_id:
+    if st.button("Objekt löschen", type="secondary"):
+        try:
+            delete_object(db, player.id, site.id, delete_id, refund_ratio=refund_ratio)
+            st.success("Objekt gelöscht.")
+            st.rerun()
+        except Exception as e:
+            st.error(str(e))
+
                 } for o in placed], hide_index=True, use_container_width=True)
     elif page == "Wareneingang":
         st.title("Wareneingang")
