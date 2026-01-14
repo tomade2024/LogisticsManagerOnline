@@ -244,11 +244,21 @@ def ensure_seed(db):
 # Business Logic
 # =========================================================
 def get_or_create_player(db, display_name: str) -> Player:
+    START_MONEY = 5_000_000  # 50.000 € (Cent)
+
     name = (display_name or "Player").strip()
     p = db.query(Player).filter(Player.display_name == name).first()
+
     if p:
+        # Bestehende Spieler auf mindestens START_MONEY anheben (Dev/MVP-Topup)
+        if p.money_cents < START_MONEY:
+            p.money_cents = START_MONEY
+            db.commit()
+            db.refresh(p)
         return p
-    p = Player(id=str(uuid.uuid4()), display_name=name, money_cents=100000)
+
+    # Neuer Spieler
+    p = Player(id=str(uuid.uuid4()), display_name=name, money_cents=START_MONEY)
     db.add(p)
     db.commit()
     db.refresh(p)
